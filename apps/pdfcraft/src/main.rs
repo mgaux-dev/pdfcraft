@@ -371,7 +371,7 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer)
 /// Whether to open the window through Xwayland instead of native Wayland: the session is Wayland
 /// and its Xwayland is running (`DISPLAY` is a local X display whose socket exists and whose
 /// server `server_answers`). `PDFCRAFT_NATIVE_WAYLAND` set to anything but empty or `0` keeps
-/// Wayland.
+/// Wayland. Linux only, the one platform that builds the X11 crates (Cargo.toml).
 ///
 /// A stopgap: the vendored winit's Wayland backend binds neither the tablet protocol
 /// (`zwp_tablet_v2`) nor `wl_data_device`. So on KDE Plasma a pen tablet
@@ -387,7 +387,7 @@ fn prefer_xwayland(
 ) -> bool {
     let set = |name: &str| var(name).is_some_and(|v| !v.trim().is_empty());
     let keep_wayland = var("PDFCRAFT_NATIVE_WAYLAND").is_some_and(|v| !matches!(v.trim(), "" | "0"));
-    if !cfg!(all(unix, not(target_os = "macos"))) || !(set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET")) || keep_wayland {
+    if !cfg!(target_os = "linux") || !(set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET")) || keep_wayland {
         return false;
     }
     // Only a local display (`:1` or `:1.0` listens on /tmp/.X11-unix/X1): winit runs one event
@@ -402,7 +402,7 @@ fn prefer_xwayland(
 /// installed ([`x11_libraries`]) and the server completes the connection handshake,
 /// authentication included, within 2 s. A missing library, a socket left behind by a crashed
 /// server, or a server that refuses this client fails here.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn x11_server_answers(display: &str) -> bool {
     let target = display.to_owned();
     let connect = move || x11rb::connect(Some(&target)).map(drop).map_err(|e| e.to_string());
@@ -415,14 +415,14 @@ fn x11_server_answers(display: &str) -> bool {
     }
 }
 
-#[cfg(not(all(unix, not(target_os = "macos"))))]
+#[cfg(not(target_os = "linux"))]
 fn x11_server_answers(_display: &str) -> bool {
     false
 }
 
 /// [`x11_server_answers`]'s check: the libraries first, since the server is asked only when
 /// winit could use it.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn x11_usable(libraries: impl FnOnce() -> Result<(), String>, connect: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), String> {
     libraries()?;
     answers_within(connect, std::time::Duration::from_secs(2))
@@ -430,7 +430,7 @@ fn x11_usable(libraries: impl FnOnce() -> Result<(), String>, connect: impl FnOn
 
 /// Opens the libraries winit's X11 start loads: Xlib, Xcursor, Xlib-xcb and XInput2, whose
 /// absence fails it (`XConnection::new`), and xkbcommon-x11, whose absence panics it.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn x11_libraries() -> Result<(), String> {
     use x11_dl::{xcursor::Xcursor, xinput2::XInput2, xlib::Xlib, xlib_xcb::Xlib_xcb};
     Xlib::open().map_err(|e| format!("libX11: {e}"))?;
@@ -443,7 +443,7 @@ fn x11_libraries() -> Result<(), String> {
 
 /// Runs `connect` on its own thread and waits up to `timeout`, so a server that never answers
 /// can't hold up start-up. After a timeout the thread is left to finish on its own.
-#[cfg(all(unix, not(target_os = "macos")))]
+#[cfg(target_os = "linux")]
 fn answers_within(connect: impl FnOnce() -> Result<(), String> + Send + 'static, timeout: std::time::Duration) -> Result<(), String> {
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
@@ -456,7 +456,7 @@ fn answers_within(connect: impl FnOnce() -> Result<(), String> + Send + 'static,
 
 /// Opens the window through Xwayland when `xwayland` ([`prefer_xwayland`]).
 fn on_xwayland(native: eframe::NativeOptions, xwayland: bool) -> eframe::NativeOptions {
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     if xwayland {
         use winit::platform::x11::EventLoopBuilderExtX11 as _;
         return eframe::NativeOptions {
@@ -1010,10 +1010,13 @@ mod tests {
         }
         let x1 = |socket: &std::path::Path| socket == std::path::Path::new("/tmp/.X11-unix/X1");
         let answers = |display: &str| display == ":1" || display == ":1.0";
-        let unix = cfg!(all(unix, not(target_os = "macos")));
-        assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1")]), x1, answers), unix);
-        assert_eq!(prefer_xwayland(env(&[("WAYLAND_SOCKET", "3"), ("DISPLAY", " :1.0 ")]), x1, answers), unix);
-        assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1"), ("PDFCRAFT_NATIVE_WAYLAND", "0")]), x1, answers), unix);
+        let linux = cfg!(target_os = "linux");
+        assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1")]), x1, answers), linux);
+        assert_eq!(prefer_xwayland(env(&[("WAYLAND_SOCKET", "3"), ("DISPLAY", " :1.0 ")]), x1, answers), linux);
+        assert_eq!(
+            prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1"), ("PDFCRAFT_NATIVE_WAYLAND", "0")]), x1, answers),
+            linux
+        );
         // Not Wayland, or asked to stay there.
         assert!(!prefer_xwayland(env(&[("DISPLAY", ":1")]), x1, answers));
         assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", " "), ("DISPLAY", ":1")]), x1, answers));
@@ -1030,7 +1033,7 @@ mod tests {
         assert!(!prefer_xwayland(env(&wayland), |_| false, |_| panic!("no socket, no connection")));
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_x_server_probe_waits_for_an_answer_but_not_forever() {
         use super::{answers_within, x11_server_answers};
@@ -1048,7 +1051,7 @@ mod tests {
         assert!(!x11_server_answers(":987654"));
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_missing_x11_library_keeps_wayland() {
         use super::x11_usable;
@@ -1063,7 +1066,7 @@ mod tests {
         use super::{native_options, on_xwayland};
         let native = || native_options(false, false, eframe::Renderer::Glow);
         assert!(on_xwayland(native(), false).event_loop_builder.is_none());
-        assert_eq!(on_xwayland(native(), true).event_loop_builder.is_some(), cfg!(all(unix, not(target_os = "macos"))));
+        assert_eq!(on_xwayland(native(), true).event_loop_builder.is_some(), cfg!(target_os = "linux"));
     }
 
     #[test]
