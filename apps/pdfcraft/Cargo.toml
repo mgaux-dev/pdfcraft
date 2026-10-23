@@ -45,6 +45,9 @@ wayland-protocols = { version = "0.32", features = ["client"] }
 # Whether the window is on Wayland, where it can't bring itself forward (src/single_instance.rs).
 # Already in the tree through winit and eframe.
 raw-window-handle = "0.6"
+# Opens the window through Xwayland on a Wayland session (`prefer_xwayland` in src/main.rs);
+# eframe doesn't re-export winit's X11 switch. The vendored winit eframe already uses.
+winit = { version = "0.30", default-features = false, features = ["x11"] }
 
 [dev-dependencies]
 # Waits for wgpu's adapter, device and error-scope futures in tests (already in the tree through wgpu).
