@@ -237,7 +237,7 @@ fn main() -> eframe::Result {
     }
     let files = rejoin_split_paths(files, |p| std::path::Path::new(p).is_file());
     let integrated = cfg!(target_os = "macos");
-    let xwayland = prefer_xwayland(|name| std::env::var(name).ok(), std::path::Path::exists);
+    let xwayland = prefer_xwayland(|name| std::env::var(name).ok(), std::path::Path::exists, x11_server_answers);
     if xwayland {
         log::info!("Wayland session: opening the window through Xwayland (PDFCRAFT_NATIVE_WAYLAND=1 keeps Wayland)");
     }
@@ -369,8 +369,9 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer)
 }
 
 /// Whether to open the window through Xwayland instead of native Wayland: the session is Wayland
-/// and its Xwayland is running (`DISPLAY` is a local X display whose socket exists).
-/// `PDFCRAFT_NATIVE_WAYLAND` set to anything but empty or `0` keeps Wayland.
+/// and its Xwayland is running (`DISPLAY` is a local X display whose socket exists and whose
+/// server `server_answers`). `PDFCRAFT_NATIVE_WAYLAND` set to anything but empty or `0` keeps
+/// Wayland.
 ///
 /// A stopgap: the vendored winit's Wayland backend binds neither the tablet protocol
 /// (`zwp_tablet_v2`) nor `wl_data_device`. So on KDE Plasma a pen tablet
@@ -379,7 +380,11 @@ fn native_options(integrated: bool, app_frame: bool, renderer: eframe::Renderer)
 /// by Xdnd.
 /// Remove this, once the vendored egui / winit supports drag and drop and
 /// pen input with pressure on Wayland.
-fn prefer_xwayland(var: impl Fn(&str) -> Option<String>, socket_exists: impl Fn(&std::path::Path) -> bool) -> bool {
+fn prefer_xwayland(
+    var: impl Fn(&str) -> Option<String>,
+    socket_exists: impl Fn(&std::path::Path) -> bool,
+    server_answers: impl FnOnce(&str) -> bool,
+) -> bool {
     let set = |name: &str| var(name).is_some_and(|v| !v.trim().is_empty());
     let keep_wayland = var("PDFCRAFT_NATIVE_WAYLAND").is_some_and(|v| !matches!(v.trim(), "" | "0"));
     if !cfg!(all(unix, not(target_os = "macos"))) || !(set("WAYLAND_DISPLAY") || set("WAYLAND_SOCKET")) || keep_wayland {
@@ -390,7 +395,41 @@ fn prefer_xwayland(var: impl Fn(&str) -> Option<String>, socket_exists: impl Fn(
     let display = var("DISPLAY").unwrap_or_default();
     let number = display.trim().strip_prefix(':').map(|n| n.split_once('.').map_or(n, |(n, _screen)| n)).unwrap_or_default();
     let local = !number.is_empty() && number.len() <= 9 && number.bytes().all(|b| b.is_ascii_digit());
-    local && socket_exists(std::path::Path::new(&format!("/tmp/.X11-unix/X{number}")))
+    local && socket_exists(std::path::Path::new(&format!("/tmp/.X11-unix/X{number}"))) && server_answers(display.trim())
+}
+
+/// Whether the X server at `display` completes the connection handshake, authentication
+/// included, within 2 s: what winit's X11 start does next. A socket left behind by a crashed
+/// server, or a server that refuses this client, fails here.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn x11_server_answers(display: &str) -> bool {
+    let target = display.to_owned();
+    let connect = move || x11rb::connect(Some(&target)).map(drop).map_err(|e| e.to_string());
+    match answers_within(connect, std::time::Duration::from_secs(2)) {
+        Ok(()) => true,
+        Err(why) => {
+            log::info!("staying on Wayland: the X server at {display} isn't usable ({why})");
+            false
+        }
+    }
+}
+
+#[cfg(not(all(unix, not(target_os = "macos"))))]
+fn x11_server_answers(_display: &str) -> bool {
+    false
+}
+
+/// Runs `connect` on its own thread and waits up to `timeout`, so a server that never answers
+/// can't hold up start-up. After a timeout the thread is left to finish on its own.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn answers_within(connect: impl FnOnce() -> Result<(), String> + Send + 'static, timeout: std::time::Duration) -> Result<(), String> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("x11-probe".into())
+        // Nobody listens after a timeout, and that's fine.
+        .spawn(move || drop(sender.send(connect())))
+        .map_err(|e| format!("no thread for the probe: {e}"))?;
+    receiver.recv_timeout(timeout).map_err(|_| format!("no answer within {timeout:?}"))?
 }
 
 /// Opens the window through Xwayland when `xwayland` ([`prefer_xwayland`]).
@@ -948,19 +987,43 @@ mod tests {
             move |name| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_owned())
         }
         let x1 = |socket: &std::path::Path| socket == std::path::Path::new("/tmp/.X11-unix/X1");
+        let answers = |display: &str| display == ":1" || display == ":1.0";
         let unix = cfg!(all(unix, not(target_os = "macos")));
-        assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1")]), x1), unix);
-        assert_eq!(prefer_xwayland(env(&[("WAYLAND_SOCKET", "3"), ("DISPLAY", " :1.0 ")]), x1), unix);
-        assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1"), ("PDFCRAFT_NATIVE_WAYLAND", "0")]), x1), unix);
+        assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1")]), x1, answers), unix);
+        assert_eq!(prefer_xwayland(env(&[("WAYLAND_SOCKET", "3"), ("DISPLAY", " :1.0 ")]), x1, answers), unix);
+        assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1"), ("PDFCRAFT_NATIVE_WAYLAND", "0")]), x1, answers), unix);
         // Not Wayland, or asked to stay there.
-        assert!(!prefer_xwayland(env(&[("DISPLAY", ":1")]), x1));
-        assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", " "), ("DISPLAY", ":1")]), x1));
-        assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1"), ("PDFCRAFT_NATIVE_WAYLAND", "1")]), x1));
+        assert!(!prefer_xwayland(env(&[("DISPLAY", ":1")]), x1, answers));
+        assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", " "), ("DISPLAY", ":1")]), x1, answers));
+        assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1"), ("PDFCRAFT_NATIVE_WAYLAND", "1")]), x1, answers));
         // No Xwayland: no DISPLAY, no socket, or a display that isn't local.
         for display in ["", ":", ":2", ":x", "host:1", "/tmp/.X11-unix/X1", ":../1", ":1234567890"] {
-            assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", display)]), x1), "{display:?}");
+            assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", display)]), x1, answers), "{display:?}");
         }
-        assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0")]), x1));
+        assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0")]), x1, answers));
+        // A socket whose server doesn't answer (a crashed one left it behind) keeps Wayland, and
+        // without a socket the server isn't asked.
+        let wayland = [("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1")];
+        assert!(!prefer_xwayland(env(&wayland), x1, |_| false));
+        assert!(!prefer_xwayland(env(&wayland), |_| false, |_| panic!("no socket, no connection")));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn the_x_server_probe_waits_for_an_answer_but_not_forever() {
+        use super::{answers_within, x11_server_answers};
+        use std::time::{Duration, Instant};
+        assert_eq!(answers_within(|| Ok(()), Duration::from_secs(10)), Ok(()));
+        assert_eq!(answers_within(|| Err("refused".into()), Duration::from_secs(10)), Err("refused".into()));
+        let started = Instant::now();
+        let silent = || {
+            std::thread::sleep(Duration::from_secs(30));
+            Ok(())
+        };
+        assert!(answers_within(silent, Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() < Duration::from_secs(10), "a silent server holds up start-up");
+        // No server listens on a display this high.
+        assert!(!x11_server_answers(":987654"));
     }
 
     #[test]
