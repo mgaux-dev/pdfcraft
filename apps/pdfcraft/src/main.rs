@@ -398,14 +398,15 @@ fn prefer_xwayland(
     local && socket_exists(std::path::Path::new(&format!("/tmp/.X11-unix/X{number}"))) && server_answers(display.trim())
 }
 
-/// Whether the X server at `display` completes the connection handshake, authentication
-/// included, within 2 s: what winit's X11 start does next. A socket left behind by a crashed
-/// server, or a server that refuses this client, fails here.
+/// Whether winit can start on the X server at `display`: the X11 libraries it loads are
+/// installed ([`x11_libraries`]) and the server completes the connection handshake,
+/// authentication included, within 2 s. A missing library, a socket left behind by a crashed
+/// server, or a server that refuses this client fails here.
 #[cfg(all(unix, not(target_os = "macos")))]
 fn x11_server_answers(display: &str) -> bool {
     let target = display.to_owned();
     let connect = move || x11rb::connect(Some(&target)).map(drop).map_err(|e| e.to_string());
-    match answers_within(connect, std::time::Duration::from_secs(2)) {
+    match x11_usable(x11_libraries, connect) {
         Ok(()) => true,
         Err(why) => {
             log::info!("staying on Wayland: the X server at {display} isn't usable ({why})");
@@ -417,6 +418,27 @@ fn x11_server_answers(display: &str) -> bool {
 #[cfg(not(all(unix, not(target_os = "macos"))))]
 fn x11_server_answers(_display: &str) -> bool {
     false
+}
+
+/// [`x11_server_answers`]'s check: the libraries first, since the server is asked only when
+/// winit could use it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn x11_usable(libraries: impl FnOnce() -> Result<(), String>, connect: impl FnOnce() -> Result<(), String> + Send + 'static) -> Result<(), String> {
+    libraries()?;
+    answers_within(connect, std::time::Duration::from_secs(2))
+}
+
+/// Opens the libraries winit's X11 start loads: Xlib, Xcursor, Xlib-xcb and XInput2, whose
+/// absence fails it (`XConnection::new`), and xkbcommon-x11, whose absence panics it.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn x11_libraries() -> Result<(), String> {
+    use x11_dl::{xcursor::Xcursor, xinput2::XInput2, xlib::Xlib, xlib_xcb::Xlib_xcb};
+    Xlib::open().map_err(|e| format!("libX11: {e}"))?;
+    Xcursor::open().map_err(|e| format!("libXcursor: {e}"))?;
+    Xlib_xcb::open().map_err(|e| format!("libX11-xcb: {e}"))?;
+    XInput2::open().map_err(|e| format!("libXi: {e}"))?;
+    xkbcommon_dl::x11::xkbcommon_x11_option().ok_or("libxkbcommon-x11 isn't installed")?;
+    Ok(())
 }
 
 /// Runs `connect` on its own thread and waits up to `timeout`, so a server that never answers
@@ -1024,6 +1046,16 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(10), "a silent server holds up start-up");
         // No server listens on a display this high.
         assert!(!x11_server_answers(":987654"));
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn a_missing_x11_library_keeps_wayland() {
+        use super::x11_usable;
+        assert_eq!(x11_usable(|| Ok(()), || Ok(())), Ok(()));
+        assert_eq!(x11_usable(|| Ok(()), || Err("refused".into())), Err("refused".into()));
+        // The server would answer, but winit couldn't start on it.
+        assert_eq!(x11_usable(|| Err("libXcursor: missing".into()), || Ok(())), Err("libXcursor: missing".into()));
     }
 
     #[test]
