@@ -391,11 +391,23 @@ fn prefer_xwayland(
         return false;
     }
     // Only a local display (`:1` or `:1.0` listens on /tmp/.X11-unix/X1): winit runs one event
-    // loop per process, so an X11 start that failed couldn't fall back to Wayland.
+    // loop per process, so an X11 start that failed couldn't fall back to Wayland. The value is
+    // checked and probed exactly as it is, never trimmed: winit's `XOpenDisplay(NULL)` reads
+    // `DISPLAY` itself, so a probe of a cleaned-up copy could pass where winit then fails.
     let display = var("DISPLAY").unwrap_or_default();
-    let number = display.trim().strip_prefix(':').map(|n| n.split_once('.').map_or(n, |(n, _screen)| n)).unwrap_or_default();
-    let local = !number.is_empty() && number.len() <= 9 && number.bytes().all(|b| b.is_ascii_digit());
-    local && socket_exists(std::path::Path::new(&format!("/tmp/.X11-unix/X{number}"))) && server_answers(display.trim())
+    let Some(number) = local_display_number(&display) else {
+        return false;
+    };
+    socket_exists(std::path::Path::new(&format!("/tmp/.X11-unix/X{number}"))) && server_answers(&display)
+}
+
+/// The display number of a local X display written exactly `:N` or `:N.S` (ASCII digits, at most
+/// nine each), or `None` for anything else, surrounding whitespace included.
+fn local_display_number(display: &str) -> Option<&str> {
+    let digits = |s: &str| !s.is_empty() && s.len() <= 9 && s.bytes().all(|b| b.is_ascii_digit());
+    let rest = display.strip_prefix(':')?;
+    let (number, screen) = rest.split_once('.').map_or((rest, None), |(n, s)| (n, Some(s)));
+    (digits(number) && screen.is_none_or(digits)).then_some(number)
 }
 
 /// Whether winit can start on the X server at `display`: the X11 libraries it loads are
@@ -1012,7 +1024,7 @@ mod tests {
         let answers = |display: &str| display == ":1" || display == ":1.0";
         let linux = cfg!(target_os = "linux");
         assert_eq!(prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1")]), x1, answers), linux);
-        assert_eq!(prefer_xwayland(env(&[("WAYLAND_SOCKET", "3"), ("DISPLAY", " :1.0 ")]), x1, answers), linux);
+        assert_eq!(prefer_xwayland(env(&[("WAYLAND_SOCKET", "3"), ("DISPLAY", ":1.0")]), x1, answers), linux);
         assert_eq!(
             prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1"), ("PDFCRAFT_NATIVE_WAYLAND", "0")]), x1, answers),
             linux
@@ -1026,6 +1038,18 @@ mod tests {
             assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", display)]), x1, answers), "{display:?}");
         }
         assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0")]), x1, answers));
+        // A DISPLAY winit's Xlib can't open as written keeps Wayland, even when the server would
+        // answer: the probe must test the value winit reads, not a cleaned-up copy.
+        for display in [" :1.0 ", " :1", ":1 ", ":1.0 ", "\t:1", ":1\n", ":1.", ":1.x", ":1.0.0", ": 1"] {
+            assert!(!prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", display)]), x1, |_| true), "{display:?}");
+        }
+        // The probe gets DISPLAY exactly as it is.
+        let probed = std::cell::RefCell::new(None);
+        prefer_xwayland(env(&[("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1.0")]), x1, |display| {
+            *probed.borrow_mut() = Some(display.to_owned());
+            true
+        });
+        assert_eq!(probed.into_inner().as_deref(), linux.then_some(":1.0"));
         // A socket whose server doesn't answer (a crashed one left it behind) keeps Wayland, and
         // without a socket the server isn't asked.
         let wayland = [("WAYLAND_DISPLAY", "wayland-0"), ("DISPLAY", ":1")];
